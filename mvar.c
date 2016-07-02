@@ -2,398 +2,226 @@
 
 #include <assert.h>
 #include <errno.h>
-#include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 
-#include <stdio.h>
-
-#define IMPLIES(a, b) ((a) ? (b) : 1)
-
-#define KNOWN_ERRORS_1(e, e1) do { \
-		assert (IMPLIES ((e), (e) == (e1))); \
-	} while (0)
-
-#define KNOWN_ERRORS_2(e, e1, e2) do { \
-		assert (IMPLIES ((e), (e) == (e1) || (e) == (e2))); \
-	} while (0)
-
-#define KNOWN_ERRORS_3(e, e1, e2, e3) do { \
-		assert (IMPLIES ((e), (e) == (e1) || (e) == (e2) || (e) == (e3))); \
-	} while (0)
-
-#define RECOVERABLE_1(e, target, e1) do { \
-		if ((e) == (e1)) \
-			goto target; \
-	} while (0)
-
-#define RECOVERABLE_2(e, target, e1, e2) do { \
-		if ((e) == (e1) || (e) == (e2)) \
-			goto target; \
-	} while (0)
-
-#define UNRECOVERABLE(e) do { \
-		assert (!(e)); \
-	} while (0)
-
-#define COND_INIT(e, target) do { \
-		KNOWN_ERRORS_3 (e, EAGAIN, EINVAL, ENOMEM); \
-		RECOVERABLE_2 (e, target, EAGAIN, ENOMEM); \
-		UNRECOVERABLE (e); \
-	} while (0)
-
-#define MUTEX_INIT(e, target) do { \
-		KNOWN_ERRORS_3 (e, EAGAIN, EINVAL, ENOMEM); \
-		RECOVERABLE_2 (e, target, EAGAIN, ENOMEM); \
-		UNRECOVERABLE (e); \
-	} while (0)
-
-#define MUTEX_DESTROY(e) do { \
-		KNOWN_ERRORS_2 (e, EBUSY, EINVAL); \
-		UNRECOVERABLE (e); \
-	} while (0)
-
-#define COND_DESTROY(e) do { \
-		KNOWN_ERRORS_2 (e, EBUSY, EINVAL); \
-		UNRECOVERABLE (e); \
-	} while (0)
-
-void
-mvar_destroy (MVar *const mvar)
+MVar *
+mvar_new (void *value)
 {
-	int e = 0;
-	assert (mvar);
-
-	e = pthread_mutex_destroy (&mvar->lock);
-	MUTEX_DESTROY (e);
-
-	e = pthread_cond_destroy (&mvar->put);
-	COND_DESTROY (e);
-
-	e = pthread_cond_destroy (&mvar->read);
-	COND_DESTROY (e);
-
-	e = pthread_cond_destroy (&mvar->take);
-	COND_DESTROY (e);
-
-	mvar->value = NULL;
-}
-
-int
-mvar_empty (MVar *const mvar)
-{
-	assert (mvar);
-	return !mvar->value;
+	MVar *mvar = malloc (sizeof (*mvar));
+	if (mvar == NULL) {
+		return NULL;
+	}
+	if (!mvar_init (mvar, value)) {
+		free (mvar);
+		return NULL;
+	}
+	return mvar;
 }
 
 void
-mvar_free (MVar *const mvar)
+mvar_free (MVar *mvar)
 {
-	assert (mvar);
 	mvar_destroy (mvar);
 	free (mvar);
 }
 
-int
-mvar_init (MVar *const mvar, void *const value)
+bool
+mvar_init (MVar *mvar, void *value)
 {
-	int e = 0;
-	assert (mvar);
-
-	e = pthread_mutex_init (&mvar->lock, NULL);
-	MUTEX_INIT (e, e_lock);
-
-	e = pthread_cond_init (&mvar->put, NULL);
-	COND_INIT (e, e_put);
-
-	e = pthread_cond_init (&mvar->read, NULL);
-	COND_INIT (e, e_read);
-
-	e = pthread_cond_init (&mvar->take, NULL);
-	COND_INIT (e, e_take);
-
-	mvar->value = NULL;
-
-	if (value)
-		e = mvar_put (mvar, value);
-
-	goto end;
-
-	e = pthread_cond_destroy (&mvar->take);
-	UNRECOVERABLE (e);
-e_take:
-
-	e = pthread_cond_destroy (&mvar->read);
-	UNRECOVERABLE (e);
-e_read:
-
-	e = pthread_cond_destroy (&mvar->put);
-	UNRECOVERABLE (e);
-e_put:
-
-	e = pthread_mutex_destroy (&mvar->lock);
-	UNRECOVERABLE (e);
-e_lock:
-
-end:
-	return e;
-}
-
-int
-mvar_lock (MVar *mvar)
-{
-	int e = 0;
-	assert (mvar);
-
-	e = pthread_mutex_lock (&mvar->lock);
-	KNOWN_ERRORS_2 (e, EDEADLK, EINVAL);
-	RECOVERABLE_1 (e, e_lock, EDEADLK);
-	UNRECOVERABLE (e);
-
-	return 0;
-
-e_lock:
-	return e;
-}
-
-MVar *
-mvar_new (void *const value)
-{
-	int e = 0;
-	MVar *mvar = malloc (sizeof (MVar));
-	if (!mvar) {
-		e = errno;
-		KNOWN_ERRORS_1 (e, ENOMEM);
-		RECOVERABLE_1 (e, e_alloc, ENOMEM);
+	*mvar = (struct MVar) {
+		.value = value,
+		/* .mutex */
+		/* .cond */
+		.have_waiters = false,
+	};
+	int rc;
+	rc = pthread_mutex_init (&mvar->mutex, NULL);
+	if (rc != 0) {
+		errno = rc;
+		return false;
 	}
-
-	e = mvar_init (mvar, value);
-	KNOWN_ERRORS_2 (e, EAGAIN, ENOMEM);
-	RECOVERABLE_2 (e, e_init, EAGAIN, ENOMEM);
-
-	return mvar;
-
-e_init:
-
-	free (mvar);
-e_alloc:
-
-	return NULL;
-}
-
-int
-mvar_put (MVar *const mvar, void *const value)
-{
-	int e = 0;
-	assert (mvar);
-
-	/* Putting nothing in does nothing. */
-	if (!value) {
-		e = EINVAL;
-		RECOVERABLE_1 (e, e_arg, EINVAL);
+	rc = pthread_cond_init (&mvar->cond, NULL);
+	if (rc != 0) {
+		int tmp_rc = pthread_mutex_destroy (&mvar->mutex);
+		assert (tmp_rc == 0);
+		errno = rc;
+		return false;
 	}
-
-	e = mvar_lock (mvar);
-	KNOWN_ERRORS_1 (e, EINVAL);
-	RECOVERABLE_1 (e, e_lock, EDEADLK);
-	UNRECOVERABLE (e);
-
-	/* Block until empty. Loop to handle spurious wakeups. */
-	while (mvar->value) {
-		e = pthread_cond_wait (&mvar->put, &mvar->lock);
-		KNOWN_ERRORS_1 (e, EINVAL);
-		UNRECOVERABLE (e);
-	}
-
-	/* Perform the actual store. */
-	mvar->value = value;
-
-	/* Notify everyone waiting to read. */
-	e = pthread_cond_broadcast (&mvar->read);
-	KNOWN_ERRORS_1 (e, EINVAL);
-	UNRECOVERABLE (e);
-
-	/* Notify someone waiting to take. Assumes fairness! */
-	e = pthread_cond_signal (&mvar->take);
-	KNOWN_ERRORS_1 (e, EINVAL);
-	UNRECOVERABLE (e);
-
-	mvar_unlock (mvar);
-
-e_lock:
-e_arg:
-
-	return e;
-}
-
-/* Returns NULL and sets errno to EDEADLK if a deadlock would occur. */
-void *
-mvar_read (MVar *const mvar)
-{
-	int e = 0;
-	void *value;
-	assert (mvar);
-
-	e = mvar_lock (mvar);
-	KNOWN_ERRORS_1 (e, EDEADLK);
-	RECOVERABLE_1 (e, e_lock, EDEADLK);
-
-	/* Block until non-empty. Loop to handle spurious wakeups. */
-	while (!mvar->value) {
-		e = pthread_cond_wait (&mvar->read, &mvar->lock);
-		KNOWN_ERRORS_1 (e, EINVAL);
-		UNRECOVERABLE (e);
-	}
-
-	/* Perform actual load. */
-	value = mvar->value;
-
-	mvar_unlock (mvar);
-
-	/* Return new value. */
-	return value;
-
-e_lock:
-	errno = e;
-	return NULL;
-
-}
-
-void *
-mvar_take (MVar *const mvar)
-{
-	int e = 0;
-	void *value;
-	assert (mvar);
-
-	mvar_lock (mvar);
-	KNOWN_ERRORS_1 (e, EDEADLK);
-	RECOVERABLE_1 (e, e_lock, EDEADLK);
-
-	/* Block until non-empty. Loop to handle spurious wakeups. */
-	while (!mvar->value) {
-		e = pthread_cond_wait (&mvar->take, &mvar->lock);
-		KNOWN_ERRORS_1 (e, EINVAL);
-		UNRECOVERABLE (e);
-	}
-
-	/* Exchange value for NULL. */
-	value = mvar->value;
-	mvar->value = NULL;
-
-	/* Notify someone waiting to put. */
-	e = pthread_cond_signal (&mvar->put);
-	KNOWN_ERRORS_1 (e, EINVAL);
-	UNRECOVERABLE (e);
-
-	mvar_unlock (mvar);
-
-	/* Return old value. */
-	return value;
-
-e_lock:
-	errno = e;
-	return NULL;
-
-}
-
-int
-mvar_try_put (MVar *const mvar, void *const value)
-{
-	int e = 0;
-	assert (mvar);
-
-	/* Putting nothing in does nothing. */
-	if (!value) {
-		e = EINVAL;
-		RECOVERABLE_1 (e, e_arg, EINVAL);
-	}
-
-	e = mvar_lock (mvar);
-	KNOWN_ERRORS_1 (e, EDEADLK);
-	RECOVERABLE_1 (e, e_lock, EDEADLK);
-
-	/* Don't block, just test. */
-	if (!mvar->value) {
-
-		mvar->value = value;
-
-		/* Notify everyone waiting to read. */
-		e = pthread_cond_broadcast (&mvar->read);
-		KNOWN_ERRORS_1 (e, EINVAL);
-		UNRECOVERABLE (e);
-
-		/* Notify someone waiting to take. Assumes fairness! */
-		e = pthread_cond_signal (&mvar->take);
-		KNOWN_ERRORS_1 (e, EINVAL);
-		UNRECOVERABLE (e);
-
-	}
-
-	mvar_unlock (mvar);
-e_lock:
-e_arg:
-
-	return e;
-
-}
-
-void *
-mvar_try_read (MVar *const mvar)
-{
-	int e = 0;
-	void *value = NULL;
-	assert (mvar);
-
-	e = mvar_lock (mvar);
-	KNOWN_ERRORS_1 (e, EDEADLK);
-	RECOVERABLE_1 (e, e_lock, EDEADLK);
-
-	value = mvar->value;
-
-	mvar_unlock (mvar);
-e_lock:
-
-	return value;
-}
-
-void *
-mvar_try_take (MVar *const mvar)
-{
-	int e = 0;
-	void *value = NULL;
-	assert (mvar);
-
-	e = mvar_lock (mvar);
-	KNOWN_ERRORS_1 (e, EDEADLK);
-	RECOVERABLE_1 (e, e_lock, EDEADLK);
-
-	/* Don't block, just test. */
-	if (mvar->value) {
-
-		/* Exchange value for NULL. */
-		value = mvar->value;
-		mvar->value = NULL;
-
-		/* Notify someone waiting to put. */
-		e = pthread_cond_signal (&mvar->put);
-		KNOWN_ERRORS_1 (e, EINVAL);
-		UNRECOVERABLE (e);
-
-	}
-
-	mvar_unlock (mvar);
-e_lock:
-
-	/* Return old value. */
-	return value;
+	return true;
 }
 
 void
-mvar_unlock (MVar *mvar)
+mvar_destroy (MVar *mvar)
 {
-	int e = 0;
-	assert (mvar);
-	e = pthread_mutex_unlock (&mvar->lock);
-	KNOWN_ERRORS_2 (e, EINVAL, EPERM);
-	UNRECOVERABLE (e);
+	int rc;
+	rc = pthread_cond_destroy (&mvar->cond);
+	assert (rc == 0);
+	rc = pthread_mutex_destroy (&mvar->mutex);
+	assert (rc == 0);
+}
+
+void
+mvar_put (MVar *mvar, void *value)
+{
+	assert (value != NULL);
+	if (mvar_try_put (mvar, value)) {
+		return;
+	}
+
+	int rc;
+	rc = pthread_mutex_lock (&mvar->mutex);
+	assert (rc == 0);
+
+	for (;;) {
+		atomic_store (&mvar->have_waiters, true);
+		if (mvar_try_put_locked (mvar, value)) {
+			break;
+		}
+		rc = pthread_cond_wait (&mvar->cond, &mvar->mutex);
+		/* EINTR is erroneously returned by some implementations (e.g. Bionic). */
+		assert (rc == 0 || rc == EINTR);
+	}
+
+	rc = pthread_mutex_unlock (&mvar->mutex);
+	assert (rc == 0);
+}
+
+void *
+mvar_take (MVar *mvar)
+{
+	void *value;
+
+	value = mvar_try_take (mvar);
+	if (value) {
+		return value;
+	}
+
+	int rc;
+	rc = pthread_mutex_lock (&mvar->mutex);
+	assert (rc == 0);
+
+	for (;;) {
+		atomic_store (&mvar->have_waiters, true);
+		value = mvar_try_take_locked (mvar);
+		if (value) {
+			break;
+		}
+		rc = pthread_cond_wait (&mvar->cond, &mvar->mutex);
+		/* EINTR is erroneously returned by some implementations (e.g. Bionic). */
+		assert (rc == 0 || rc == EINTR);
+	}
+
+	rc = pthread_mutex_unlock (&mvar->mutex);
+	assert (rc == 0);
+
+	return value;
+}
+
+bool
+mvar_try_put (MVar *mvar, void *value)
+{
+	assert (value != NULL);
+	void *expected = NULL;
+	if (atomic_compare_exchange_strong (&mvar->value, &expected, value)) {
+		mvar_wake_readers (mvar);
+		return true;
+	}
+	return false;
+}
+
+bool
+mvar_try_put_locked (MVar *mvar, void *value)
+{
+	assert (value != NULL);
+	void *expected = NULL;
+	if (atomic_compare_exchange_strong (&mvar->value, &expected, value)) {
+		mvar_wake_readers_locked (mvar);
+		return true;
+	}
+	return false;
+}
+
+void *
+mvar_try_take (MVar *mvar)
+{
+	/* FIXME(strager): This is sub-optimal on some architectures. */
+	for (;;) {
+		/* TODO(strager): Consider memory_order_relaxed. */
+		void *old_value = atomic_load (&mvar->value);
+		if (old_value == NULL) {
+			return NULL;
+		}
+		if (atomic_compare_exchange_weak (&mvar->value, &old_value, NULL)) {
+			mvar_wake_writers (mvar);
+			return old_value;
+		}
+	}
+}
+
+void *
+mvar_try_take_locked (MVar *mvar)
+{
+	/* FIXME(strager): This is sub-optimal on some architectures. */
+	for (;;) {
+		/* TODO(strager): Consider memory_order_relaxed. */
+		void *old_value = atomic_load (&mvar->value);
+		if (old_value == NULL) {
+			return NULL;
+		}
+		if (atomic_compare_exchange_weak (&mvar->value, &old_value, NULL)) {
+			mvar_wake_writers_locked (mvar);
+			return old_value;
+		}
+	}
+}
+
+void
+mvar_wake_readers (MVar *mvar)
+{
+	if (!atomic_load (&mvar->have_waiters)) {
+		return;
+	}
+
+	int rc;
+	rc = pthread_mutex_lock (&mvar->mutex);
+	assert (rc == 0);
+
+	mvar_wake_readers_locked (mvar);
+
+	rc = pthread_mutex_unlock (&mvar->mutex);
+	assert (rc == 0);
+}
+
+void
+mvar_wake_writers (MVar *mvar)
+{
+	if (!atomic_load (&mvar->have_waiters)) {
+		return;
+	}
+
+	int rc;
+	rc = pthread_mutex_lock (&mvar->mutex);
+	assert (rc == 0);
+
+	mvar_wake_writers_locked (mvar);
+
+	rc = pthread_mutex_unlock (&mvar->mutex);
+	assert (rc == 0);
+}
+
+void
+mvar_wake_readers_locked (MVar *mvar)
+{
+	if (atomic_load_explicit (&mvar->have_waiters, memory_order_relaxed)) {
+		pthread_cond_broadcast (&mvar->cond);
+	}
+}
+
+void
+mvar_wake_writers_locked (MVar *mvar)
+{
+	if (atomic_load_explicit (&mvar->have_waiters, memory_order_relaxed)) {
+		pthread_cond_broadcast (&mvar->cond);
+	}
 }

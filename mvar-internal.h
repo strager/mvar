@@ -4,25 +4,26 @@
 #include <mvar.h>
 
 #include <pthread.h>
-#include <stdarg.h>
-#include <stdio.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 
 struct MVar {
-	pthread_mutex_t lock;
-	pthread_cond_t put, read, take;
-	void *volatile value;
+	void *_Atomic value;
+
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+	bool _Atomic have_waiters;
 };
 
-/* Deinitialize an MVar in place. */
+bool mvar_init (MVar *mvar, void *value);
 void mvar_destroy (MVar *mvar);
 
-/* Initialize an MVar with a value, or NULL for no value. */
-int mvar_init (MVar *mvar, void *value);
+bool mvar_try_put_locked (MVar *mvar, void *value);
+void *mvar_try_take_locked (MVar *mvar);
 
-/* Take exclusive ownership of an MVar. */
-int mvar_lock (MVar *mvar);
-
-/* Release ownership of an MVar. */
-void mvar_unlock (MVar *mvar);
+void mvar_wake_readers (MVar *mvar);
+void mvar_wake_writers (MVar *mvar);
+void mvar_wake_readers_locked (MVar *mvar);
+void mvar_wake_writers_locked (MVar *mvar);
 
 #endif /* MVAR_INTERNAL_H_2222195A_A36B_4D94_9066_E8645E3AA5D9 */

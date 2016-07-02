@@ -24,25 +24,6 @@ incrementor (void *data)
 int main ()
 {
 	{
-		MVar mvar;
-		void *p;
-		int e = 0;
-
-		mvar_init (&mvar, NULL);
-		assert (mvar_empty (&mvar));
-		e = mvar_put (&mvar, (void *)0x1234);
-		assert (e == 0);
-		assert (!mvar_empty (&mvar));
-		p = mvar_read (&mvar);
-		assert (p);
-		assert (!mvar_empty (&mvar));
-		p = mvar_take (&mvar);
-		assert (p);
-		assert (mvar_empty (&mvar));
-		mvar_destroy (&mvar);
-	}
-
-	{
 		MVar *mvar = mvar_new ((void *)1);
 		pthread_t thread1, thread2;
 		IncrementorState state;
