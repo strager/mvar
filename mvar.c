@@ -32,8 +32,10 @@ mvar_init (MVar *mvar, void *value)
 	*mvar = (struct MVar) {
 		.value = value,
 		/* .mutex */
-		/* .cond */
-		.have_waiters = false,
+		/* .reader_cond */
+		.have_waiting_readers = false,
+		/* .writer_cond */
+		.have_waiting_writers = false,
 	};
 	int rc;
 	rc = pthread_mutex_init (&mvar->mutex, NULL);
@@ -41,9 +43,19 @@ mvar_init (MVar *mvar, void *value)
 		errno = rc;
 		return false;
 	}
-	rc = pthread_cond_init (&mvar->cond, NULL);
+	rc = pthread_cond_init (&mvar->reader_cond, NULL);
 	if (rc != 0) {
 		int tmp_rc = pthread_mutex_destroy (&mvar->mutex);
+		assert (tmp_rc == 0);
+		errno = rc;
+		return false;
+	}
+	rc = pthread_cond_init (&mvar->writer_cond, NULL);
+	if (rc != 0) {
+		int tmp_rc;
+		tmp_rc = pthread_cond_destroy (&mvar->reader_cond);
+		assert (tmp_rc == 0);
+		tmp_rc = pthread_mutex_destroy (&mvar->mutex);
 		assert (tmp_rc == 0);
 		errno = rc;
 		return false;
@@ -55,7 +67,9 @@ void
 mvar_destroy (MVar *mvar)
 {
 	int rc;
-	rc = pthread_cond_destroy (&mvar->cond);
+	rc = pthread_cond_destroy (&mvar->writer_cond);
+	assert (rc == 0);
+	rc = pthread_cond_destroy (&mvar->reader_cond);
 	assert (rc == 0);
 	rc = pthread_mutex_destroy (&mvar->mutex);
 	assert (rc == 0);
@@ -74,11 +88,11 @@ mvar_put (MVar *mvar, void *value)
 	assert (rc == 0);
 
 	for (;;) {
-		atomic_store (&mvar->have_waiters, true);
+		atomic_store (&mvar->have_waiting_writers, true);
 		if (mvar_try_put_locked (mvar, value)) {
 			break;
 		}
-		rc = pthread_cond_wait (&mvar->cond, &mvar->mutex);
+		rc = pthread_cond_wait (&mvar->writer_cond, &mvar->mutex);
 		/* EINTR is erroneously returned by some implementations (e.g. Bionic). */
 		assert (rc == 0 || rc == EINTR);
 	}
@@ -102,12 +116,12 @@ mvar_take (MVar *mvar)
 	assert (rc == 0);
 
 	for (;;) {
-		atomic_store (&mvar->have_waiters, true);
+		atomic_store (&mvar->have_waiting_readers, true);
 		value = mvar_try_take_locked (mvar);
 		if (value) {
 			break;
 		}
-		rc = pthread_cond_wait (&mvar->cond, &mvar->mutex);
+		rc = pthread_cond_wait (&mvar->reader_cond, &mvar->mutex);
 		/* EINTR is erroneously returned by some implementations (e.g. Bionic). */
 		assert (rc == 0 || rc == EINTR);
 	}
@@ -179,7 +193,7 @@ mvar_try_take_locked (MVar *mvar)
 void
 mvar_wake_readers (MVar *mvar)
 {
-	if (!atomic_load (&mvar->have_waiters)) {
+	if (!atomic_load (&mvar->have_waiting_readers)) {
 		return;
 	}
 
@@ -196,7 +210,7 @@ mvar_wake_readers (MVar *mvar)
 void
 mvar_wake_writers (MVar *mvar)
 {
-	if (!atomic_load (&mvar->have_waiters)) {
+	if (!atomic_load (&mvar->have_waiting_writers)) {
 		return;
 	}
 
@@ -213,17 +227,15 @@ mvar_wake_writers (MVar *mvar)
 void
 mvar_wake_readers_locked (MVar *mvar)
 {
-	if (atomic_load_explicit (&mvar->have_waiters, memory_order_relaxed)) {
-		atomic_store (&mvar->have_waiters, false);
-		pthread_cond_broadcast (&mvar->cond);
+	if (atomic_exchange (&mvar->have_waiting_readers, false)) {
+		pthread_cond_signal (&mvar->reader_cond);
 	}
 }
 
 void
 mvar_wake_writers_locked (MVar *mvar)
 {
-	if (atomic_load_explicit (&mvar->have_waiters, memory_order_relaxed)) {
-		atomic_store (&mvar->have_waiters, false);
-		pthread_cond_broadcast (&mvar->cond);
+	if (atomic_exchange (&mvar->have_waiting_writers, false)) {
+		pthread_cond_signal (&mvar->writer_cond);
 	}
 }

@@ -11,8 +11,10 @@ struct MVar {
 	void *_Atomic value;
 
 	pthread_mutex_t mutex;
-	pthread_cond_t cond;
-	bool _Atomic have_waiters;
+	pthread_cond_t reader_cond;
+	bool _Atomic have_waiting_readers;
+	pthread_cond_t writer_cond;
+	bool _Atomic have_waiting_writers;
 };
 
 bool mvar_init (MVar *mvar, void *value);
