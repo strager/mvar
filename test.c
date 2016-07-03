@@ -14,9 +14,9 @@ incrementor (void *data)
 	IncrementorState *state = (IncrementorState *)data;
 	int i;
 	for (i = 0; i < 100000; ++i) {
-		(void)mvar_take (state->mvar);
+		void *old = mvar_take (state->mvar);
 		++state->value;
-		mvar_put (state->mvar, (void *)1);
+		mvar_put (state->mvar, (void *)((uintptr_t)old + 1));
 	}
 	return NULL;
 }
@@ -33,8 +33,10 @@ int main ()
 		pthread_create (&thread2, NULL, incrementor, (void *)&state);
 		pthread_join (thread1, NULL);
 		pthread_join (thread2, NULL);
+		void *final = mvar_take (state.mvar);
 		mvar_free (mvar);
 		assert (state.value == 200000);
+		assert (final == (void *) 200001);
 	}
 
 	printf ("All tests passed. :)\n");
