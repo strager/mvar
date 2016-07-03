@@ -214,6 +214,7 @@ void
 mvar_wake_readers_locked (MVar *mvar)
 {
 	if (atomic_load_explicit (&mvar->have_waiters, memory_order_relaxed)) {
+		atomic_store (&mvar->have_waiters, false);
 		pthread_cond_broadcast (&mvar->cond);
 	}
 }
@@ -222,6 +223,7 @@ void
 mvar_wake_writers_locked (MVar *mvar)
 {
 	if (atomic_load_explicit (&mvar->have_waiters, memory_order_relaxed)) {
+		atomic_store (&mvar->have_waiters, false);
 		pthread_cond_broadcast (&mvar->cond);
 	}
 }
