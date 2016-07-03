@@ -1,0 +1,4 @@
+#pragma once
+
+#cmakedefine01 MVAR_USE_GENERATION_FUTEX
+#cmakedefine01 MVAR_USE_MACH_SEMAPHORE

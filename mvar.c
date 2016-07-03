@@ -11,6 +11,22 @@
 #include <mach/task.h>
 #endif
 
+#if MVAR_USE_GENERATION_FUTEX
+#include <errno.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
+#include <unistd.h>
+#endif
+
+#if MVAR_USE_GENERATION_FUTEX
+static int
+futex(int *uaddr, int op, int val, const struct timespec *timeout, int *uaddr2, int val3)
+{
+	return syscall(SYS_futex, uaddr, op, val, timeout, uaddr2, val3);
+}
+#endif
+
 MVar *
 mvar_new (void *value)
 {
@@ -43,6 +59,10 @@ mvar_init (MVar *mvar, void *value)
 		.put_sem = SEMAPHORE_NULL,
 		.take_sem = SEMAPHORE_NULL,
 #endif
+#if MVAR_USE_GENERATION_FUTEX
+		.put_generation = 0,
+		.take_generation = 0,
+#endif
 	};
 	return true;
 }
@@ -73,6 +93,8 @@ mvar_put (MVar *mvar, void *value)
 		}
 #if MVAR_USE_MACH_SEMAPHORE
 		mvar_sem_wait (&mvar->put_sem, &mvar->put_sem_value);
+#elif MVAR_USE_GENERATION_FUTEX
+		mvar_generation_wait (&mvar->put_generation);
 #else
 #error "Unknown implementation"
 #endif
@@ -91,6 +113,8 @@ mvar_take (MVar *mvar)
 		}
 #if MVAR_USE_MACH_SEMAPHORE
 		mvar_sem_wait (&mvar->take_sem, &mvar->take_sem_value);
+#elif MVAR_USE_GENERATION_FUTEX
+		mvar_generation_wait (&mvar->take_generation);
 #else
 #error "Unknown implementation"
 #endif
@@ -107,6 +131,8 @@ mvar_try_put (MVar *mvar, void *value)
 	if (atomic_compare_exchange_strong (&mvar->value, &expected, value)) {
 #if MVAR_USE_MACH_SEMAPHORE
 		mvar_sem_signal (&mvar->take_sem, &mvar->take_sem_value);
+#elif MVAR_USE_GENERATION_FUTEX
+		mvar_generation_signal (&mvar->take_generation);
 #else
 #error "Unknown implementation"
 #endif
@@ -128,6 +154,8 @@ mvar_try_take (MVar *mvar)
 		if (atomic_compare_exchange_weak (&mvar->value, &old_value, NULL)) {
 #if MVAR_USE_MACH_SEMAPHORE
 			mvar_sem_signal (&mvar->put_sem, &mvar->put_sem_value);
+#elif MVAR_USE_GENERATION_FUTEX
+			mvar_generation_signal (&mvar->put_generation);
 #else
 #error "Unknown implementation"
 #endif
@@ -185,5 +213,32 @@ mvar_sem_wait (semaphore_t _Atomic *sem, int32_t _Atomic *sem_value)
 		rc = semaphore_wait (s);
 		assert (rc == KERN_SUCCESS || rc == KERN_ABORTED);
 	} while (rc == KERN_ABORTED); /* EINTR */
+}
+#endif
+
+#if MVAR_USE_GENERATION_FUTEX
+void
+mvar_generation_signal (unsigned _Atomic *generation)
+{
+	unsigned old = atomic_fetch_add (generation, MVAR_GENERATION_BUMP);
+	if (old & MVAR_GENERATION_HAVE_WAITERS) {
+		atomic_fetch_and (generation, ~(unsigned) MVAR_GENERATION_HAVE_WAITERS);
+		_Static_assert (sizeof (unsigned _Atomic) == sizeof (int), "Expected unsigned _Atomic to match int");
+		int rc = futex ((int *) generation, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, NULL, NULL, 0);
+		assert (rc == 0 || rc == 1);
+	}
+}
+
+void
+mvar_generation_wait (unsigned _Atomic *generation)
+{
+	unsigned old = atomic_fetch_or (generation, MVAR_GENERATION_HAVE_WAITERS);
+	_Static_assert (sizeof (unsigned _Atomic) == sizeof (int), "Expected unsigned _Atomic to match int");
+	int rc = futex ((int *) generation, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, old | MVAR_GENERATION_HAVE_WAITERS, NULL, NULL, 0);
+	if (rc == -1) {
+		assert (errno == EWOULDBLOCK || errno == EINTR);
+		return;
+	}
+	assert (rc == 0);
 }
 #endif
