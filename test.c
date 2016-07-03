@@ -1,6 +1,8 @@
+#undef NDEBUG
+#include <assert.h>
+
 #include <mvar-internal.h>
 
-#include <assert.h>
 #include <stdio.h>
 
 typedef struct {
