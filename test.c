@@ -27,18 +27,21 @@ int main ()
 {
 	{
 		MVar *mvar = mvar_new ((void *)1);
-		pthread_t thread1, thread2;
+		enum { THREAD_COUNT = 4 };
+		pthread_t threads[THREAD_COUNT];
 		IncrementorState state;
 		state.mvar = mvar;
 		state.value = 0;
-		pthread_create (&thread1, NULL, incrementor, (void *)&state);
-		pthread_create (&thread2, NULL, incrementor, (void *)&state);
-		pthread_join (thread1, NULL);
-		pthread_join (thread2, NULL);
+		for (int i = 0; i < THREAD_COUNT; ++i) {
+			pthread_create (&threads[i], NULL, incrementor, (void *)&state);
+		}
+		for (int i = 0; i < THREAD_COUNT; ++i) {
+			pthread_join (threads[i], NULL);
+		}
 		void *final = mvar_take (state.mvar);
 		mvar_free (mvar);
-		assert (state.value == 200000);
-		assert (final == (void *) 200001);
+		assert (state.value == 100000 * THREAD_COUNT);
+		assert (final == (void *) (100000 * THREAD_COUNT + 1));
 	}
 
 	printf ("All tests passed. :)\n");
