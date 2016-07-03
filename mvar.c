@@ -51,6 +51,7 @@ void
 mvar_destroy (MVar *mvar)
 {
 	assert (!atomic_load_explicit (&mvar->value, memory_order_relaxed));
+#if MVAR_USE_MACH_SEMAPHORE
 	if (mvar->put_sem != SEMAPHORE_NULL) {
 		kern_return_t rc = semaphore_destroy (mach_task_self(), mvar->put_sem);
 		assert (rc == KERN_SUCCESS);
@@ -59,6 +60,7 @@ mvar_destroy (MVar *mvar)
 		kern_return_t rc = semaphore_destroy (mach_task_self(), mvar->take_sem);
 		assert (rc == KERN_SUCCESS);
 	}
+#endif
 }
 
 void
@@ -66,10 +68,10 @@ mvar_put (MVar *mvar, void *value)
 {
 	assert (value != NULL);
 	for (;;) {
-#if MVAR_USE_MACH_SEMAPHORE
 		if (mvar_try_put (mvar, value)) {
 			break;
 		}
+#if MVAR_USE_MACH_SEMAPHORE
 		mvar_sem_wait (&mvar->put_sem, &mvar->put_sem_value);
 #else
 #error "Unknown implementation"
@@ -83,11 +85,11 @@ mvar_take (MVar *mvar)
 	void *value;
 
 	for (;;) {
-#if MVAR_USE_MACH_SEMAPHORE
 		value = mvar_try_take (mvar);
 		if (value) {
 			return value;
 		}
+#if MVAR_USE_MACH_SEMAPHORE
 		mvar_sem_wait (&mvar->take_sem, &mvar->take_sem_value);
 #else
 #error "Unknown implementation"
@@ -103,7 +105,11 @@ mvar_try_put (MVar *mvar, void *value)
 	assert (value != NULL);
 	void *expected = NULL;
 	if (atomic_compare_exchange_strong (&mvar->value, &expected, value)) {
+#if MVAR_USE_MACH_SEMAPHORE
 		mvar_sem_signal (&mvar->take_sem, &mvar->take_sem_value);
+#else
+#error "Unknown implementation"
+#endif
 		return true;
 	}
 	return false;
@@ -120,7 +126,11 @@ mvar_try_take (MVar *mvar)
 			return NULL;
 		}
 		if (atomic_compare_exchange_weak (&mvar->value, &old_value, NULL)) {
+#if MVAR_USE_MACH_SEMAPHORE
 			mvar_sem_signal (&mvar->put_sem, &mvar->put_sem_value);
+#else
+#error "Unknown implementation"
+#endif
 			return old_value;
 		}
 	}
