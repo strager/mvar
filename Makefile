@@ -9,7 +9,8 @@ clean :
 	-rm -rf mvar.o libmvar.a test
 
 libmvar.a : mvar.o Makefile
-	ar qc $@ $<
+	-rm -f $@
+	ar rc $@ $<
 
 mvar.o : mvar.c Makefile
 	$(CC) -c $< -I. -o $@ $(debug_flags) $(warning_flags)
