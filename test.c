@@ -34,10 +34,11 @@ int main ()
 		IncrementorState state;
 		state.mvar = mvar;
 		state.value = 0;
-		for (int i = 0; i < THREAD_COUNT; ++i) {
+		int i;
+		for (i = 0; i < THREAD_COUNT; ++i) {
 			pthread_create (&threads[i], NULL, incrementor, (void *)&state);
 		}
-		for (int i = 0; i < THREAD_COUNT; ++i) {
+		for (i = 0; i < THREAD_COUNT; ++i) {
 			pthread_join (threads[i], NULL);
 		}
 		void *final = mvar_take (state.mvar);
