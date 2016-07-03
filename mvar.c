@@ -1,7 +1,6 @@
 #include <mvar-internal.h>
 
 #include <assert.h>
-#include <errno.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 
@@ -31,74 +30,40 @@ mvar_init (MVar *mvar, void *value)
 {
 	*mvar = (struct MVar) {
 		.value = value,
-		/* .mutex */
-		/* .reader_cond */
-		.have_waiting_readers = false,
-		/* .writer_cond */
-		.have_waiting_writers = false,
+#if MVAR_USE_DISPATCH_SEMAPHORE
+		.put_semaphore = dispatch_semaphore_create (value ? 0 : 1),
+		.take_semaphore = dispatch_semaphore_create (value ? 1 : 0),
+#endif
 	};
-	int rc;
-	rc = pthread_mutex_init (&mvar->mutex, NULL);
-	if (rc != 0) {
-		errno = rc;
-		return false;
-	}
-	rc = pthread_cond_init (&mvar->reader_cond, NULL);
-	if (rc != 0) {
-		int tmp_rc = pthread_mutex_destroy (&mvar->mutex);
-		assert (tmp_rc == 0);
-		errno = rc;
-		return false;
-	}
-	rc = pthread_cond_init (&mvar->writer_cond, NULL);
-	if (rc != 0) {
-		int tmp_rc;
-		tmp_rc = pthread_cond_destroy (&mvar->reader_cond);
-		assert (tmp_rc == 0);
-		tmp_rc = pthread_mutex_destroy (&mvar->mutex);
-		assert (tmp_rc == 0);
-		errno = rc;
-		return false;
-	}
+#if MVAR_USE_DISPATCH_SEMAPHORE
+	assert (mvar->put_semaphore);
+	assert (mvar->take_semaphore);
+#endif
 	return true;
 }
 
 void
 mvar_destroy (MVar *mvar)
 {
-	int rc;
-	rc = pthread_cond_destroy (&mvar->writer_cond);
-	assert (rc == 0);
-	rc = pthread_cond_destroy (&mvar->reader_cond);
-	assert (rc == 0);
-	rc = pthread_mutex_destroy (&mvar->mutex);
-	assert (rc == 0);
+	assert (!atomic_load_explicit (&mvar->value, memory_order_relaxed));
+	dispatch_release (mvar->put_semaphore);
+	dispatch_release (mvar->take_semaphore);
 }
 
 void
 mvar_put (MVar *mvar, void *value)
 {
 	assert (value != NULL);
-	if (mvar_try_put (mvar, value)) {
-		return;
-	}
-
-	int rc;
-	rc = pthread_mutex_lock (&mvar->mutex);
-	assert (rc == 0);
-
 	for (;;) {
-		atomic_store (&mvar->have_waiting_writers, true);
-		if (mvar_try_put_locked (mvar, value)) {
+#if MVAR_USE_DISPATCH_SEMAPHORE
+		if (mvar_try_put (mvar, value)) {
 			break;
 		}
-		rc = pthread_cond_wait (&mvar->writer_cond, &mvar->mutex);
-		/* EINTR is erroneously returned by some implementations (e.g. Bionic). */
-		assert (rc == 0 || rc == EINTR);
+		dispatch_semaphore_wait (mvar->put_semaphore, DISPATCH_TIME_FOREVER);
+#else
+#error "Unknown implementation"
+#endif
 	}
-
-	rc = pthread_mutex_unlock (&mvar->mutex);
-	assert (rc == 0);
 }
 
 void *
@@ -106,28 +71,17 @@ mvar_take (MVar *mvar)
 {
 	void *value;
 
-	value = mvar_try_take (mvar);
-	if (value) {
-		return value;
-	}
-
-	int rc;
-	rc = pthread_mutex_lock (&mvar->mutex);
-	assert (rc == 0);
-
 	for (;;) {
-		atomic_store (&mvar->have_waiting_readers, true);
-		value = mvar_try_take_locked (mvar);
+#if MVAR_USE_DISPATCH_SEMAPHORE
+		value = mvar_try_take (mvar);
 		if (value) {
-			break;
+			return value;
 		}
-		rc = pthread_cond_wait (&mvar->reader_cond, &mvar->mutex);
-		/* EINTR is erroneously returned by some implementations (e.g. Bionic). */
-		assert (rc == 0 || rc == EINTR);
+		dispatch_semaphore_wait (mvar->take_semaphore, DISPATCH_TIME_FOREVER);
+#else
+#error "Unknown implementation"
+#endif
 	}
-
-	rc = pthread_mutex_unlock (&mvar->mutex);
-	assert (rc == 0);
 
 	return value;
 }
@@ -138,19 +92,7 @@ mvar_try_put (MVar *mvar, void *value)
 	assert (value != NULL);
 	void *expected = NULL;
 	if (atomic_compare_exchange_strong (&mvar->value, &expected, value)) {
-		mvar_wake_readers (mvar);
-		return true;
-	}
-	return false;
-}
-
-bool
-mvar_try_put_locked (MVar *mvar, void *value)
-{
-	assert (value != NULL);
-	void *expected = NULL;
-	if (atomic_compare_exchange_strong (&mvar->value, &expected, value)) {
-		mvar_wake_readers_locked (mvar);
+		dispatch_semaphore_signal (mvar->take_semaphore);
 		return true;
 	}
 	return false;
@@ -167,75 +109,8 @@ mvar_try_take (MVar *mvar)
 			return NULL;
 		}
 		if (atomic_compare_exchange_weak (&mvar->value, &old_value, NULL)) {
-			mvar_wake_writers (mvar);
+			dispatch_semaphore_signal (mvar->put_semaphore);
 			return old_value;
 		}
-	}
-}
-
-void *
-mvar_try_take_locked (MVar *mvar)
-{
-	/* FIXME(strager): This is sub-optimal on some architectures. */
-	for (;;) {
-		/* TODO(strager): Consider memory_order_relaxed. */
-		void *old_value = atomic_load (&mvar->value);
-		if (old_value == NULL) {
-			return NULL;
-		}
-		if (atomic_compare_exchange_weak (&mvar->value, &old_value, NULL)) {
-			mvar_wake_writers_locked (mvar);
-			return old_value;
-		}
-	}
-}
-
-void
-mvar_wake_readers (MVar *mvar)
-{
-	if (!atomic_load (&mvar->have_waiting_readers)) {
-		return;
-	}
-
-	int rc;
-	rc = pthread_mutex_lock (&mvar->mutex);
-	assert (rc == 0);
-
-	mvar_wake_readers_locked (mvar);
-
-	rc = pthread_mutex_unlock (&mvar->mutex);
-	assert (rc == 0);
-}
-
-void
-mvar_wake_writers (MVar *mvar)
-{
-	if (!atomic_load (&mvar->have_waiting_writers)) {
-		return;
-	}
-
-	int rc;
-	rc = pthread_mutex_lock (&mvar->mutex);
-	assert (rc == 0);
-
-	mvar_wake_writers_locked (mvar);
-
-	rc = pthread_mutex_unlock (&mvar->mutex);
-	assert (rc == 0);
-}
-
-void
-mvar_wake_readers_locked (MVar *mvar)
-{
-	if (atomic_exchange (&mvar->have_waiting_readers, false)) {
-		pthread_cond_signal (&mvar->reader_cond);
-	}
-}
-
-void
-mvar_wake_writers_locked (MVar *mvar)
-{
-	if (atomic_exchange (&mvar->have_waiting_writers, false)) {
-		pthread_cond_signal (&mvar->writer_cond);
 	}
 }
